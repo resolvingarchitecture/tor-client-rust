@@ -1,0 +1,18 @@
+[package]
+name = "tor_client"
+version = "0.1.0"
+authors = ["Brian Taylor <brian@resolvingarchitecture.io>"]
+license = "MIT"
+edition = "2021"
+description = "A client for a local Tor daemon (SOCKS proxy + control port), usable as a 1M5 protocol service"
+homepage = "https://resolvingarchitecture.io"
+repository = "https://github.com/resolvingarchitecture/tor-client-rust"
+readme = "README.md"
+keywords = ["tor", "socks", "privacy", "onion"]
+categories = ["network-programming"]
+
+[dependencies]
+log = "0.4"
+seda_bus = { path = "../seda-bus-rust" }
+
+[dev-dependencies]
