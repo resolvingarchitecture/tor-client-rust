@@ -1,4 +1,6 @@
-//! A tiny HTTP/1.1 GET over a SOCKS tunnel. HTTP only (no TLS).
+//! A tiny HTTP/1.1 GET. HTTP only (no TLS). The request/response helpers are
+//! transport-agnostic; [`fetch_via_socks`] drives them over a blocking SOCKS
+//! tunnel, and `embedded` drives them over an Arti stream.
 
 use std::io::{self, Read, Write};
 use std::time::Duration;
@@ -15,22 +17,15 @@ pub fn fetch_via_socks(
     let (host, port, path) = parse_url(url)?;
 
     let mut stream = socks::connect_through(proxy_host, proxy_port, &host, port, timeout)?;
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: ra-tor-client\r\nAccept: */*\r\nConnection: close\r\n\r\n"
-    );
-    stream.write_all(req.as_bytes())?;
+    stream.write_all(format_get(&host, &path).as_bytes())?;
 
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw)?;
-
-    // Split headers / body on the first CRLFCRLF.
-    match find(&raw, b"\r\n\r\n") {
-        Some(i) => Ok(raw[i + 4..].to_vec()),
-        None => Ok(raw),
-    }
+    Ok(split_body(raw))
 }
 
-fn parse_url(url: &str) -> io::Result<(String, u16, String)> {
+/// Split `host:port` and path out of an `http://` URL. Errors on any other scheme.
+pub(crate) fn parse_url(url: &str) -> io::Result<(String, u16, String)> {
     let rest = url.strip_prefix("http://").ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::Unsupported,
@@ -52,6 +47,18 @@ fn parse_url(url: &str) -> io::Result<(String, u16, String)> {
     Ok((host, port, path.to_string()))
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+/// The GET request line + headers for `path` on `host`, `Connection: close`.
+pub(crate) fn format_get(host: &str, path: &str) -> String {
+    format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: ra-tor-client\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    )
+}
+
+/// Everything after the first CRLFCRLF (the body), or the whole buffer if no
+/// header/body separator is present.
+pub(crate) fn split_body(raw: Vec<u8>) -> Vec<u8> {
+    match raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        Some(i) => raw[i + 4..].to_vec(),
+        None => raw,
+    }
 }

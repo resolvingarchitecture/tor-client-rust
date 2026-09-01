@@ -19,12 +19,52 @@ fn detector_reports_nothing_when_ports_closed() {
     assert!(!d.is_local_tor_running());
 }
 
+#[cfg(not(feature = "embedded"))]
 #[test]
-fn start_fails_cleanly_without_a_daemon() {
+fn start_fails_cleanly_without_a_daemon_or_embedded() {
+    // auto mode (default), no daemon, `embedded` feature not built -> clean
+    // failure, not an error. (With the feature built, auto would bootstrap Arti
+    // here - see the ignored live test below.)
     let mut cfg = HashMap::new();
     cfg.insert("ra.tor.socksPort".into(), "9098".into());
     cfg.insert("ra.tor.controlPort".into(), "9099".into());
     let client = TorClient::from_config(&cfg);
+    assert!(!client.start());
+    assert_eq!(client.status(), Status::Disconnected);
+}
+
+/// Live: `embedded` mode actually bootstraps Arti and fetches over Tor.
+/// Needs network + ~10-30s. Run with:
+/// `cargo test --features embedded -- --ignored embedded_bootstraps`
+#[cfg(feature = "embedded")]
+#[test]
+#[ignore]
+fn embedded_bootstraps_and_fetches() {
+    let dir = std::env::temp_dir().join(format!("ra-tor-it-{}", std::process::id()));
+    let mut cfg = HashMap::new();
+    cfg.insert("ra.tor.mode".into(), "embedded".into());
+    cfg.insert("ra.tor.dataDir".into(), dir.display().to_string());
+    let client = TorClient::from_config(&cfg);
+    assert!(client.start(), "embedded Arti should bootstrap");
+    assert_eq!(client.status(), Status::Connected);
+
+    let mut env = seda_bus::Envelope::new("x", Vec::new());
+    env.headers
+        .insert("url".into(), "http://example.com/".into());
+    assert!(client.send(&mut env), "fetch over Tor should succeed");
+    assert!(!env.payload.is_empty());
+    client.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn local_mode_without_a_daemon_is_disconnected() {
+    let mut cfg = HashMap::new();
+    cfg.insert("ra.tor.mode".into(), "local".into());
+    cfg.insert("ra.tor.socksPort".into(), "9098".into());
+    cfg.insert("ra.tor.controlPort".into(), "9099".into());
+    let client = TorClient::from_config(&cfg);
+    assert_eq!(client.mode(), tor_client::Mode::Local);
     assert!(!client.start());
     assert_eq!(client.status(), Status::Disconnected);
 }

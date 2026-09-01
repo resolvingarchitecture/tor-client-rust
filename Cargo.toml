@@ -1,10 +1,10 @@
 [package]
 name = "tor_client"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Brian Taylor <brian@resolvingarchitecture.io>"]
 license = "MIT"
 edition = "2021"
-description = "A client for a local Tor daemon (SOCKS proxy + control port), usable as a 1M5 protocol service"
+description = "A Tor client for 1M5: a local Tor daemon (SOCKS) or embedded Arti, selected by ra.tor.mode"
 homepage = "https://resolvingarchitecture.io"
 repository = "https://github.com/resolvingarchitecture/tor-client-rust"
 readme = "README.md"
@@ -14,5 +14,21 @@ categories = ["network-programming"]
 [dependencies]
 log = "0.4"
 seda_bus = { path = "../seda-bus-rust" }
+
+# --- embedded Tor (feature "embedded") ---
+# Arti is the Tor Project's pure-Rust Tor client. Heavy (tokio, rustls, the
+# tor-* crate family); off by default. rustls (not native-tls) to avoid a C
+# OpenSSL dependency.
+# static-sqlite bundles SQLite (no system libsqlite3 / -dev needed, and portable
+# to targets like Redox); rustls (not native-tls) avoids a C OpenSSL dependency.
+arti-client = { version = "0.45", default-features = false, features = ["tokio", "rustls", "static-sqlite", "onion-service-client", "compression", "flowctl-cc"], optional = true }
+tor-rtcompat = { version = "0.45", default-features = false, features = ["tokio", "rustls"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "io-util"], optional = true }
+# Pin the rustls CryptoProvider (ring) so Arti's TLS setup is unambiguous.
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+
+[features]
+default = []
+embedded = ["dep:arti-client", "dep:tor-rtcompat", "dep:tokio", "dep:rustls"]
 
 [dev-dependencies]

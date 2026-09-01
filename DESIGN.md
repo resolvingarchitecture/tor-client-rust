@@ -1,70 +1,116 @@
 # tor-client (Rust) — Design
 
-A client for a **local Tor daemon**, exposed as a small `TorClient` type that
-`1m5-core-rust` wraps as the Tor **protocol service**. A Rust port of the design
-in [`tor-client-java`](https://github.com/resolvingarchitecture/tor-client-java),
-trimmed to what the router needs today.
+A Tor client exposed as a small `TorClient` type that `1m5-core-rust` wraps as
+the Tor **protocol service**. A Rust port of the design in
+[`tor-client-java`](https://github.com/resolvingarchitecture/tor-client-java),
+trimmed to what the router needs today, with an embedded backend added so it runs
+where no system Tor exists.
 
 ## Where it sits
 
     1m5-core-rust  ──wraps──►  tor_client::TorClient
       onemfive_core::protocol::TorProtocolService (impl Service + Transport)
                                      │
-                          SOCKS5 proxy 127.0.0.1:9050   (outbound)
-                          control port 127.0.0.1:9051   (readiness probe)
-                                     │
-                          tor daemon (installed on host)
+                    ┌────────────────┴─────────────────┐
+              local backend                      embedded backend
+              SOCKS5 127.0.0.1:9050              arti_client::TorClient
+              control 127.0.0.1:9051 (probe)     (pure-Rust Tor, in-process)
+                    │                                   │
+              system tor daemon                   the Tor network directly
 
-`1m5-core-rust`'s `RoutingService` discovers the protocol service by name and
-pushes a routing-slip hop carrying the destination URL; the adapter calls
-`TorClient::send`.
+`RoutingService` discovers the protocol service by name and pushes a
+routing-slip hop carrying the destination URL; the adapter calls
+`TorClient::send`, which dispatches to whichever backend is active.
+
+## Modes (`ra.tor.mode`)
+
+`Mode { Local, Embedded, Auto }`, mirroring `i2p-rust`'s `Mode`.
+
+- **`local`** — require a running daemon; `start()` fails fast (returns `false`,
+  status `Disconnected`) if the SOCKS + control ports don't both answer.
+- **`embedded`** — run Arti in-process (`embedded` feature; without it, `start()`
+  returns `false` with status `Disconnected` and a build hint).
+- **`auto`** (default) — `effective_mode()` probes the local daemon once at
+  `start()`: reachable → `local`, else `embedded`. Then **runtime fallback**
+  (below) keeps `auto` on the best available backend.
+
+## Runtime fallback (auto only)
+
+Inline in `send()` — no background threads, matching the "the bus stage owns the
+thread" model.
+
+- **local → embedded.** A `send()` over the local backend that fails is
+  re-checked against the detector. If the daemon is *gone* (not merely a bad
+  onion / unreachable host), `activate_embedded()` starts Arti, the active
+  backend switches, and the request is retried once over embedded. Status stays
+  `Connected` throughout — the router sees only a `NetworkStatus` no-op.
+- **embedded → local.** While serving on embedded under `auto`, each `send()`
+  calls `maybe_switch_back_to_local()`, which re-probes the local port at most
+  once per `LOCAL_REPROBE_INTERVAL` (30s, rate-limited via an epoch-millis
+  `AtomicU64`). When the daemon is back, the active backend flips to `local`.
+  The embedded Arti client is kept warm (not dropped) so a flapping daemon
+  doesn't cost repeated bootstraps; `stop()` drops it.
 
 ## Components
 
     LocalTorDetector   probes SOCKS + control ports (TcpStream::connect_timeout)
-                       so start() fails fast instead of a confusing error later
-    socks              minimal SOCKS5 CONNECT client, no auth (VER=5 greeting,
-                       ATYP=3 domain request, parse BND reply)
-    http               HTTP/1.1 GET over the SOCKS tunnel, split on CRLFCRLF;
-                       http:// only (no TLS)
-    TorClient          config, status (AtomicU8), start()/stop()/send()
+    socks              minimal SOCKS5 CONNECT client, no auth
+    http               request/response helpers (parse_url, format_get,
+                        split_body) shared by both backends; http:// only, no TLS
+    embedded           (feature "embedded") EmbeddedTor: a Tokio runtime on
+                        dedicated workers + a bootstrapped arti_client::TorClient;
+                        Arti drives its own background tasks, so no driver thread
+    TorClient          config, status + active-backend as AtomicU8, mode,
+                        start()/stop()/send(), the fallback logic
 
 ## Message flow
 
 **Outbound** — `1m5-core-rust` routes an `Envelope` whose `headers["url"]` is a
-`.onion` or clearnet `http://` URL. `TorClient::send` opens a SOCKS5 tunnel to
-the URL's host through `127.0.0.1:9050`, issues `GET`, and puts the response body
-in `envelope.payload` (or an error string in `envelope.headers["error"]`).
+`.onion` or clearnet `http://` URL.
 
-**Inbound** — not implemented. `tor-client-java` runs a hidden service via the
-control connection; here the control port is only probed. See `TODO.md`.
+- *local*: `http::fetch_via_socks` opens a SOCKS5 tunnel through `127.0.0.1:9050`,
+  issues `GET`, returns the body.
+- *embedded*: `EmbeddedTor::fetch` does `client.connect((host, port)).await` for
+  a `DataStream`, then the same `GET` over it, inside `runtime.block_on`.
+
+Body → `envelope.payload`; any error string → `envelope.headers["error"]`.
+
+**Inbound** — not implemented (see `TODO.md`); Arti's `onion-service-client`
+feature is enabled for *connecting to* `.onion`, not hosting.
 
 ## Status model
 
-`Status { Connecting, Connected, Disconnected, Error }`, stored as an `AtomicU8`
-so it can be read without locking.
+`Status { Connecting, Connected, Disconnected, Error }` as an `AtomicU8`.
 
-- `start()` → `Connecting`, then `Connected` if both ports answer, else logs a
-  setup hint and returns to `Disconnected` (returns `false`, cleanly — never
-  panics or blocks).
-- `stop()` → `Disconnected`.
+- `start()` → `Connecting`, then `Connected` once a backend is active, else
+  `Disconnected` (nothing available) or `Error` (embedded feature built but Arti
+  bootstrap failed).
+- `stop()` → `Disconnected`, drops the embedded client.
 
-The `1m5-core-rust` adapter maps this onto its own `NetworkStatus`.
+The `1m5-core-rust` adapter maps this onto its own `NetworkStatus`; the
+local/embedded switch is deliberately invisible there.
+
+## Dependencies
+
+Default build: `log` + `seda_bus` only. The `embedded` feature adds
+`arti-client` (with `rustls` + bundled `static-sqlite`, avoiding system OpenSSL
+and libsqlite3), `tor-rtcompat`, `tokio`, and `rustls` (ring provider, pinned so
+Arti's TLS setup is unambiguous). Heavy — off by default.
 
 ## Rust adaptations vs. the Java client
 
 - No inheritance / `NetworkService` base — `TorClient` is a plain struct; the
   bus lifecycle lives in `1m5-core-rust`'s adapter.
-- No `TaskRunner` status poller — status is set at `start()`/`stop()`; a live
-  poll would reconnect to the control port.
-- Hand-rolled SOCKS5 + HTTP instead of pulling in `reqwest`/`tokio` — keeps the
-  crate dependency-light and blocking (the bus stage owns the thread).
-- The Tor control protocol client (`TORControlConnection` & friends in Java) is
-  not ported yet.
+- No `TaskRunner` status poller — status is set at `start()`/`stop()`/`send()`.
+- Hand-rolled SOCKS5 + HTTP for the local path instead of `reqwest` — keeps the
+  default build dependency-light and blocking.
+- The Tor control protocol client (`TORControlConnection` & friends) is still
+  not ported — the control port is probed only.
 
 ## Not here
 
-- HTTPS (needs `rustls`/`native-tls`).
+- HTTPS (needs `rustls`/`native-tls` at the request layer).
 - Tor control protocol: authentication, event stream, `NEWNYM`, circuit info.
 - Hidden service (onion) hosting for inbound envelopes.
 - Stream isolation per identity / per destination.
+- Bridges / pluggable transports for the embedded backend.
