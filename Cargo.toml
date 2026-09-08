@@ -13,7 +13,7 @@ categories = ["network-programming"]
 
 [dependencies]
 log = "0.4"
-seda_bus = { path = "../seda-bus-rust" }
+seda_bus = { path = "../../seda-bus/seda-bus-rust" }
 
 # --- embedded Tor (feature "embedded") ---
 # Arti is the Tor Project's pure-Rust Tor client. Heavy (tokio, rustls, the
